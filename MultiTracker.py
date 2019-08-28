@@ -8,6 +8,7 @@ import math
 from util import *
 import logging
 import warnings
+from numpy.linalg import norm
 
 def warn(*args, **kwargs):
     pass
@@ -30,6 +31,8 @@ class MultiTracker(object):
         self.abnormal5 = 0
         self.cfg = trackerCfg
         self.totalTracker = 0
+        self.PRECISION = 100
+        self.affinityThreshold = 0.3
 
     def initTracker(self,boxes, logger):
         bbox = boxes[:,np.newaxis]
@@ -46,18 +49,23 @@ class MultiTracker(object):
     def getMatchingCost(self,detBoxes,predBoxes):
         detCnt = len(detBoxes)
         predCnt = len(predBoxes) 
+        iouMatrix = np.zeros((detCnt,predCnt))
         costMatrix = np.zeros((detCnt,predCnt))
         for i, det in enumerate(detBoxes):
             for j,pred in enumerate(predBoxes):
                 trkHist = self.activeTracker[j].trackHistory
+                trackerInstance = self.activeTracker[j]
                 iou = self.costIOU(det,pred)
-                area = self.costPosArea(det,pred)
-                speed = self.costSpeed(trkHist,det)
-                cost = 0.5*iou+0.25*area+0.25*speed 
-                #if(iou<0.3 and area < 0.3):
-                #    cost = 0.5*iou + 0.5*area 
-                #elif(iou < 0.5 or area < 0.5):
-                #    speed = self.costSpeed(trkHist,det)
+                linPosArea = self.costLinPosArea(det,pred)
+                expPosArea = self.costExpPosArea(det,pred)
+                costM = self.costMaha(det,pred,trackerInstance)
+                #speed = self.costSpeed(trkHist,det)
+                cost = self.PRECISION*iou
+                #cost = expPosArea 
+                #cost *= self.PRECISION
+                #if(iou<0.3 and costExpPosArea < 0.3):
+                #    cost = 0.5*iou + 0.5*costExpPosArea 
+                #elif(iou < 0.5 or costExpPosArea < 0.5):
                 #    cost = 0.25*iou + 0.25*area + 0.5*speed
                 #    intersect = self.getArea(self.intersection(det,pred))
                 #    minArea = min(self.getArea(det),self.getArea(pred))
@@ -70,11 +78,11 @@ class MultiTracker(object):
                 #        if (costB > 0.75):
                 #            cost = 100
                 #        else:
-                #            cost = 0.5*iou + 0.5*area + speed*1.5 
-                            
-                costMatrix[i,j] = cost
-               
-        return costMatrix
+                #            cost = 0.5*iou + 0.5*area + speed*1.5
+                #print("for matching cost speed is:", speed)
+                costMatrix[i, j] = cost
+                iouMatrix[i, j] = costM
+        return costMatrix, iouMatrix
 
     def doTracking(self, res, img=""):
         #if(len(self.activeTracker)==0):
@@ -111,7 +119,7 @@ class MultiTracker(object):
                 bbox = np.array([x, y, w, h])
                 detectBoxes.append(bbox)
         
-        costMatrix = self.getMatchingCost(detectBoxes,predictBoxes)              
+        costMatrix, iouMatrix = self.getMatchingCost(detectBoxes,predictBoxes)              
 
         unmatchedDetections = []
         unmatchedTrackers = []
@@ -128,7 +136,8 @@ class MultiTracker(object):
         #filter out low IOU 
         matches = []
         for m in match_indice:
-            if(costMatrix[m[0],m[1]]>5):
+            if(iouMatrix[m[0],m[1]]  > 9.4877): #self.affinityThreshold*self.PRECISION):
+            #if(iouMatrix[m[0],m[1]] > self.affinityThreshold):
                 unmatchedDetections.append(m[0])
                 unmatchedTrackers.append(m[1])
             else:
@@ -208,18 +217,40 @@ class MultiTracker(object):
         cost = 1.0-IOU
         return cost 
 
-    def costPosArea(sef, det,pred):
-        ndx = (det[0]-pred[0])/min(det[2],pred[2])
-        ndy = (det[1]-pred[1])/min(det[3],pred[3])
-        costA = math.exp(-0.5*(ndx*ndx+ndy*ndy))
-        ndw = (det[2]-pred[2])/(det[2]+pred[2])
-        ndh = (det[3]-pred[3])/(det[3]+pred[3])
-        costB = math.exp(-0.5*(ndw*ndw+ndh*ndh))
+    def costExpPosArea(sef, det,pred):
+        dcx = det[0] + det[2]/2
+        dcy = det[1] + det[3]/2
+        pcx = pred[0] + pred[2]/2
+        pcy = pred[1] + pred[3]/2
 
-        cost = 1.0-costA*costB
+        ndx = (dcx-pcx)/det[2]
+        ndy = (dcy-pcy)/det[3]
+        costA = math.exp(-0.5*(ndx**2+ndy**2))
+        ndw = abs(det[2]-pred[2])/(det[2]+pred[2])
+        ndh = abs(det[3]-pred[3])/(det[3]+pred[3])
+        costB = math.exp(-0.5*(ndw+ndh))
+
+        cost = 1.0-(costA*costB)
 
         return cost
 
+    def costMaha(self, det, pred, trackerInstance):
+        
+        deltaY = np.array([det[i]-pred[i] for i in range(4)]) 
+        mahalanobis = math.sqrt(float(np.dot(np.dot(deltaY.T, trackerInstance.kf.SI),deltaY)))
+        return mahalanobis        
+
+    def costLinPosArea(self, det, pred):
+        
+        dcx = det[0] + det[2]/2
+        dcy = det[1] + det[3]/2
+        pcx = pred[0] + pred[2]/2
+        pcy = pred[1] + pred[3]/2
+
+        posCost = np.sqrt(pow(dcx-pcx,2) + pow(dcy-pcy,2))/1797
+        shapeCost = np.sqrt(pow(det[2]-pred[2],2)+pow(det[3]-pred[3],2))/3228496
+
+        return posCost*shapeCost
 
     def costSpeed(self, trkHist,det):
         frameNow = len(trkHist)
@@ -253,6 +284,8 @@ class MultiTracker(object):
             angleBtwDet = getAngle(cntOfTopDet,cntOfTopLH)
             
             pntN = centerOfTop(trkHist[frameNow-1].box)
+            vecDP = (pntN[0]-cntOfTopLH[0],pntN[1]-cntOfTopLH[1])
+            vecDD = (cntOfTopDet[0]-cntOfTopLH[0],cntOfTopDet[1]-cntOfTopLH[1])
             predictAngle = getAngle(pntN,cntOfTopLH) 
             
             direction = (predictAngle-angleBtwDet)
@@ -266,9 +299,15 @@ class MultiTracker(object):
                 if(deltaDist > Lef*(frameNow-lastHit-1)):
                     return cost 
                 else:
-                    cost = 1.0-0.5*(math.exp(deltaDist*-1/10)) - 0.5*((direction/2*np.pi)**2)
+                    cost = np.dot(vecDP,vecDD)/(norm(vecDP)*norm(vecDD))
+                    
+                    #cost = 1.0-(0.5*(math.exp(deltaDist*-0.1)) - 0.5*((direction/2*np.pi)**2))
+                    #print("cost speed is ", cost)
+                    #print("detlaDist is ", deltaDist)
+                    #print("Lef is", Lef*(frameNow-lastHit-1))
+                    #print("direction is ", direction)
                     #cost = 1.0 - 0.5*(math.exp(deltaDist*-1/30)) - 0.5*((abs(direction)/2*np.pi))
-                    #cost = 1.0-math.exp(deltaDist*-1)
+                    #cost = 1.0-math.exp(deltaDist*-1/10)
         return cost
 
     def getHistory(self):
